@@ -5,8 +5,8 @@ import os
 import zipfile
 from typing import List
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, Depends, Header
+from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.templating import Jinja2Templates
 import numpy as np
@@ -19,8 +19,19 @@ from .db import (
     GALLERY_DIR,
     relpath_from_gallery,
     abspath_in_gallery,
+    create_user,
+    get_user_by_email,
+    set_user_embedding_phash,
+    create_or_get_event,
+    upsert_asset,
+    insert_asset_face,
+    rank_assets_by_phash,
+    get_event_by_name,
+    rank_assets_by_phash_for_event,
+    create_guest_link,
 )
 from .face import detect_faces_bgr, crop_with_margin, compute_phash
+from .auth import hash_password, verify_password, create_access_token, decode_access_token
 
 app = FastAPI(title="THE MOVING FRAMES")
 
@@ -44,6 +55,110 @@ def on_startup() -> None:
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     return templates.TemplateResponse("index.html", {"request": request, "gallery": GALLERY_DIR})
+@app.get("/home", response_class=HTMLResponse)
+async def home(request: Request):
+    return templates.TemplateResponse("home.html", {"request": request})
+def get_current_user(authorization: str | None = Header(default=None)):
+    if not authorization or not authorization.startswith("Bearer "):
+        return None
+    token = authorization.split(" ", 1)[1]
+    payload = decode_access_token(token)
+    return payload
+
+
+@app.post("/signup")
+async def signup(name: str = Form(...), age: int | None = Form(None), gender: str | None = Form(None), contact: str | None = Form(None), email: str = Form(...), password: str = Form(...)):
+    conn = get_connection()
+    ensure_schema(conn)
+    if get_user_by_email(conn, email):
+        raise HTTPException(status_code=400, detail="Email already registered")
+    user_id = create_user(conn, name=name, age=age, gender=gender, contact=contact, email=email, password_hash=hash_password(password), role="customer")
+    token = create_access_token({"sub": str(user_id), "email": email})
+    return {"access_token": token, "token_type": "bearer", "user_id": user_id}
+
+
+@app.post("/login")
+async def login(email: str = Form(...), password: str = Form(...)):
+    conn = get_connection()
+    user = get_user_by_email(conn, email)
+    if not user or not verify_password(password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    token = create_access_token({"sub": str(user["id"]), "email": user["email"], "role": user["role"]})
+    return {"access_token": token, "token_type": "bearer", "user_id": user["id"]}
+
+
+@app.post("/upload")
+async def upload(event_name: str = Form(...), files: list[UploadFile] = File(...), user=Depends(get_current_user)):
+    if not user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    conn = get_connection()
+    ensure_schema(conn)
+    event_id = create_or_get_event(conn, name=event_name, owner_user_id=int(user.get("sub")))
+    os.makedirs(GALLERY_DIR, exist_ok=True)
+    # Save and index
+    for f in files:
+        data = await f.read()
+        arr = np.frombuffer(data, dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img is None:
+            continue
+        # save under event folder
+        rel_dir = os.path.join(event_name)
+        abs_dir = os.path.join(GALLERY_DIR, rel_dir)
+        os.makedirs(abs_dir, exist_ok=True)
+        rel_path = os.path.join(rel_dir, f.filename)
+        abs_path = os.path.join(abs_dir, f.filename)
+        cv2.imencode('.jpg', img)[1].tofile(abs_path)
+        asset_id = upsert_asset(conn, event_id=event_id, rel_path=rel_path)
+        # detect faces and index
+        faces = detect_faces_bgr(img)
+        for box in faces:
+            crop = crop_with_margin(img, box, margin_ratio=0.25)
+            ph = compute_phash(crop)
+            insert_asset_face(conn, asset_id=asset_id, x=box.x, y=box.y, w=box.w, h=box.h, phash=ph)
+    return {"status": "ok"}
+
+
+@app.post("/match_face")
+async def match_face(file: UploadFile = File(...), event_name: str | None = Form(None)):
+    data = await file.read()
+    arr = np.frombuffer(data, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img is None:
+        raise HTTPException(status_code=400, detail="Invalid image")
+    faces = detect_faces_bgr(img)
+    if not faces:
+        raise HTTPException(status_code=400, detail="No face detected")
+    crop = crop_with_margin(img, faces[0], margin_ratio=0.25)
+    q = compute_phash(crop)
+    conn = get_connection()
+    if event_name:
+        ev = get_event_by_name(conn, event_name)
+        if ev:
+            res = rank_assets_by_phash_for_event(conn, q, event_id=int(ev["id"]), max_results=200)
+        else:
+            res = rank_assets_by_phash(conn, q, max_results=200)
+    else:
+        res = rank_assets_by_phash(conn, q, max_results=200)
+    return {"results": [{"image_path": r.image_path, "distance": r.best_distance} for r in res]}
+
+
+@app.get("/photos/{user_id}")
+async def photos(user_id: int):
+    # Placeholder: In a full system, map user embedding to assets via joins
+    return JSONResponse({"results": []})
+
+
+@app.post("/generate_link")
+async def generate_link(event_name: str = Form(...), user=Depends(get_current_user)):
+    if not user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    conn = get_connection()
+    ev = get_event_by_name(conn, event_name)
+    if not ev:
+        raise HTTPException(status_code=404, detail="Event not found")
+    token = create_guest_link(conn, event_id=int(ev["id"]), created_by_user_id=int(user.get("sub")))
+    return {"token": token}
 
 
 @app.post("/search")

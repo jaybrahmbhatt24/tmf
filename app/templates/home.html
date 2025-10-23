@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>THE MOVING FRAMES</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>THE MOVING FRAMES</h1>
+      <p class="tagline">Find Your Moments, Just by Your Face.</p>
+    </header>
+
+    <section class="upload">
+      <h2>Try it now</h2>
+      <input type="file" id="faceUpload" accept="image/*" />
+      <button id="btnMatch">Find My Photos</button>
+      <div id="status"></div>
+    </section>
+
+    <section id="results" class="results hidden">
+      <h2>Your Matches</h2>
+      <div id="grid" class="grid"></div>
+    </section>
+  </div>
+
+  <script>
+    const input = document.getElementById('faceUpload');
+    const btn = document.getElementById('btnMatch');
+    const grid = document.getElementById('grid');
+    const statusEl = document.getElementById('status');
+    const results = document.getElementById('results');
+
+    btn.addEventListener('click', async () => {
+      if (!input.files[0]) { statusEl.textContent = 'Upload a face photo.'; return; }
+      statusEl.textContent = 'Searching...';
+      const fd = new FormData();
+      fd.append('file', input.files[0]);
+      const res = await fetch('/match_face', { method: 'POST', body: fd });
+      if (!res.ok) { statusEl.textContent = 'Failed to match.'; return; }
+      const data = await res.json();
+      render(data.results || []);
+      statusEl.textContent = '';
+    });
+
+    function render(items) {
+      grid.innerHTML = '';
+      if (!items.length) { results.classList.add('hidden'); return; }
+      results.classList.remove('hidden');
+      for (const it of items) {
+        const card = document.createElement('div');
+        card.className = 'card';
+        const img = document.createElement('img');
+        img.src = '/gallery/' + it.image_path;
+        const meta = document.createElement('div');
+        meta.className = 'meta';
+        meta.textContent = 'distance: ' + it.distance;
+        card.appendChild(img); card.appendChild(meta);
+        grid.appendChild(card);
+      }
+    }
+  </script>
+</body>
+</html>
