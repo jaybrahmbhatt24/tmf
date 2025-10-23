@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Guest Access - THE MOVING FRAMES</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="container">
+    <h1>Guest Access</h1>
+    <p>Event: {{ event_name }}</p>
+
+    <section class="upload">
+      <input type="file" id="file" accept="image/*" />
+      <button id="btn">Find My Photos</button>
+      <div id="status"></div>
+    </section>
+
+    <section id="results" class="results hidden">
+      <h2>Results</h2>
+      <form id="dl">
+        <div id="grid" class="grid"></div>
+        <button type="submit">Download Selected</button>
+      </form>
+    </section>
+  </div>
+
+  <script>
+    const file = document.getElementById('file');
+    const btn = document.getElementById('btn');
+    const statusEl = document.getElementById('status');
+    const gridEl = document.getElementById('grid');
+    const results = document.getElementById('results');
+    const form = document.getElementById('dl');
+
+    btn.addEventListener('click', async () => {
+      if (!file.files[0]) { statusEl.textContent = 'Upload a face image.'; return; }
+      statusEl.textContent = 'Searching...';
+      const fd = new FormData(); fd.append('file', file.files[0]);
+      const res = await fetch(window.location.pathname + '/match', { method: 'POST', body: fd });
+      if (!res.ok) { statusEl.textContent = 'Failed.'; return; }
+      const data = await res.json(); render(data.results || []);
+      statusEl.textContent = '';
+    });
+
+    function render(items) {
+      gridEl.innerHTML = '';
+      if (!items.length) { results.classList.add('hidden'); return; }
+      results.classList.remove('hidden');
+      items.forEach((item) => {
+        const card = document.createElement('div'); card.className = 'card';
+        const label = document.createElement('label');
+        const cb = document.createElement('input'); cb.type = 'checkbox'; cb.name = 'selected'; cb.value = item.image_path;
+        const img = document.createElement('img'); img.src = '/gallery/' + item.image_path;
+        const meta = document.createElement('div'); meta.className = 'meta'; meta.textContent = 'distance: ' + item.distance;
+        label.appendChild(cb); label.appendChild(img); card.appendChild(label); card.appendChild(meta); gridEl.appendChild(card);
+      });
+    }
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const selected = Array.from(document.querySelectorAll('input[name="selected"]:checked')).map(el => el.value);
+      if (!selected.length) return;
+      const fd = new FormData(); selected.forEach(p => fd.append('selected', p));
+      const res = await fetch(window.location.pathname + '/download', { method: 'POST', body: fd });
+      if (!res.ok) return;
+      const blob = await res.blob(); const url = URL.createObjectURL(blob);
+      const a = document.createElement('a'); a.href = url; a.download = 'tmf_photos.zip'; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+    });
+  </script>
+</body>
+</html>
