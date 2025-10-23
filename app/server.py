@@ -6,7 +6,7 @@ import zipfile
 from typing import List
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, Depends, Header
-from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
+from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.templating import Jinja2Templates
 import numpy as np
@@ -29,6 +29,10 @@ from .db import (
     get_event_by_name,
     rank_assets_by_phash_for_event,
     create_guest_link,
+    get_guest_link,
+    get_event_by_id,
+    log_activity,
+    log_download,
 )
 from .face import detect_faces_bgr, crop_with_margin, compute_phash
 from .auth import hash_password, verify_password, create_access_token, decode_access_token
@@ -58,6 +62,20 @@ async def index(request: Request):
 @app.get("/home", response_class=HTMLResponse)
 async def home(request: Request):
     return templates.TemplateResponse("home.html", {"request": request})
+
+@app.get("/about", response_class=HTMLResponse)
+async def about(request: Request):
+    return templates.TemplateResponse("about.html", {"request": request})
+
+@app.get("/contact", response_class=HTMLResponse)
+async def contact_get(request: Request):
+    return templates.TemplateResponse("contact.html", {"request": request, "ok": False})
+
+@app.post("/contact", response_class=HTMLResponse)
+async def contact_post(request: Request, name: str = Form(...), email: str = Form(...), message: str = Form(...)):
+    conn = get_connection()
+    log_activity(conn, user_id=None, action="contact", detail=f"{name} <{email}>: {message[:500]}")
+    return templates.TemplateResponse("contact.html", {"request": request, "ok": True})
 def get_current_user(authorization: str | None = Header(default=None)):
     if not authorization or not authorization.startswith("Bearer "):
         return None
@@ -84,6 +102,7 @@ async def login(email: str = Form(...), password: str = Form(...)):
     if not user or not verify_password(password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     token = create_access_token({"sub": str(user["id"]), "email": user["email"], "role": user["role"]})
+    log_activity(conn, user_id=int(user["id"]), action="login", detail=user["email"])
     return {"access_token": token, "token_type": "bearer", "user_id": user["id"]}
 
 
@@ -117,6 +136,66 @@ async def upload(event_name: str = Form(...), files: list[UploadFile] = File(...
             ph = compute_phash(crop)
             insert_asset_face(conn, asset_id=asset_id, x=box.x, y=box.y, w=box.w, h=box.h, phash=ph)
     return {"status": "ok"}
+
+
+def _safe_extract_zip_to_event_dir(z: zipfile.ZipFile, event_dir_abs: str) -> list[str]:
+    os.makedirs(event_dir_abs, exist_ok=True)
+    saved_paths: list[str] = []
+    valid_exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+    base = os.path.abspath(event_dir_abs)
+    for info in z.infolist():
+        if info.is_dir():
+            continue
+        name = info.filename
+        # normalize path
+        name = name.replace("\\", "/")
+        # disallow absolute and parent traversal
+        if name.startswith("/") or name.startswith("\\") or ".." in name.split("/"):
+            continue
+        _, ext = os.path.splitext(name.lower())
+        if ext not in valid_exts:
+            continue
+        dest_abs = os.path.abspath(os.path.join(base, name))
+        if os.path.commonpath([dest_abs, base]) != base:
+            continue
+        os.makedirs(os.path.dirname(dest_abs), exist_ok=True)
+        with z.open(info, "r") as src, open(dest_abs, "wb") as out:
+            out.write(src.read())
+        rel = os.path.relpath(dest_abs, start=os.path.abspath(GALLERY_DIR))
+        saved_paths.append(rel)
+    return saved_paths
+
+
+@app.post("/upload_zip")
+async def upload_zip(event_name: str = Form(...), file: UploadFile = File(...), user=Depends(get_current_user)):
+    if not user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    conn = get_connection()
+    ensure_schema(conn)
+    event_id = create_or_get_event(conn, name=event_name, owner_user_id=int(user.get("sub")))
+    rel_dir = os.path.join(event_name)
+    abs_dir = os.path.join(GALLERY_DIR, rel_dir)
+    data = await file.read()
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            rel_paths = _safe_extract_zip_to_event_dir(z, abs_dir)
+    except zipfile.BadZipFile:
+        raise HTTPException(status_code=400, detail="Invalid ZIP file")
+
+    # Index extracted images
+    for rel_path in rel_paths:
+        abs_path = os.path.join(GALLERY_DIR, rel_path)
+        file_bytes = np.fromfile(abs_path, dtype=np.uint8)
+        img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+        if img is None:
+            continue
+        asset_id = upsert_asset(conn, event_id=event_id, rel_path=rel_path)
+        faces = detect_faces_bgr(img)
+        for box in faces:
+            crop = crop_with_margin(img, box, margin_ratio=0.25)
+            ph = compute_phash(crop)
+            insert_asset_face(conn, asset_id=asset_id, x=box.x, y=box.y, w=box.w, h=box.h, phash=ph)
+    return {"status": "ok", "files_indexed": len(rel_paths)}
 
 
 @app.post("/match_face")
@@ -158,7 +237,65 @@ async def generate_link(event_name: str = Form(...), user=Depends(get_current_us
     if not ev:
         raise HTTPException(status_code=404, detail="Event not found")
     token = create_guest_link(conn, event_id=int(ev["id"]), created_by_user_id=int(user.get("sub")))
+    log_activity(conn, user_id=int(user.get("sub")), action="generate_link", detail=f"event={event_name}")
     return {"token": token}
+
+
+@app.get("/g/{token}", response_class=HTMLResponse)
+async def guest_page(request: Request, token: str):
+    conn = get_connection()
+    link = get_guest_link(conn, token)
+    if not link:
+        raise HTTPException(status_code=404, detail="Invalid link")
+    ev = get_event_by_id(conn, int(link["event_id"]))
+    return templates.TemplateResponse("guest.html", {"request": request, "token": token, "event_name": ev["name"] if ev else ""})
+
+
+@app.post("/g/{token}/match")
+async def guest_match(token: str, file: UploadFile = File(...)):
+    conn = get_connection()
+    link = get_guest_link(conn, token)
+    if not link:
+        raise HTTPException(status_code=404, detail="Invalid link")
+    data = await file.read()
+    arr = np.frombuffer(data, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img is None:
+        raise HTTPException(status_code=400, detail="Invalid image")
+    faces = detect_faces_bgr(img)
+    if not faces:
+        raise HTTPException(status_code=400, detail="No face detected")
+    crop = crop_with_margin(img, faces[0], margin_ratio=0.25)
+    q = compute_phash(crop)
+    res = rank_assets_by_phash_for_event(conn, q, event_id=int(link["event_id"]), max_results=200)
+    log_activity(conn, user_id=None, action="guest_match", detail=f"token={token} count={len(res)}")
+    return {"results": [{"image_path": r.image_path, "distance": r.best_distance} for r in res]}
+
+
+@app.post("/g/{token}/download")
+async def guest_download(token: str, selected: List[str] = Form(...)):
+    conn = get_connection()
+    link = get_guest_link(conn, token)
+    if not link:
+        raise HTTPException(status_code=404, detail="Invalid link")
+    # Validate that selected assets belong to the linked event
+    event_id = int(link["event_id"])
+    # Map rel paths to assets in event
+    rows = list(get_connection().execute("SELECT path FROM assets WHERE event_id = ?", (event_id,)))
+    allowed = {r["path"] for r in rows}
+    filtered = [p for p in selected if p in allowed]
+    if not filtered:
+        raise HTTPException(status_code=400, detail="No valid files selected")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for rel_path in filtered:
+            abs_path = abspath_in_gallery(rel_path)
+            if os.path.isfile(abs_path):
+                zf.write(abs_path, arcname=rel_path)
+    buf.seek(0)
+    log_download(conn, user_id=None, asset_count=len(filtered))
+    headers = {"Content-Disposition": "attachment; filename=tmf_guest_photos.zip"}
+    return StreamingResponse(buf, media_type="application/zip", headers=headers)
 
 
 @app.post("/search")
@@ -200,5 +337,8 @@ async def download(selected: List[str] = Form(...)):
             if os.path.isfile(abs_path):
                 zf.write(abs_path, arcname=rel_path)
     buf.seek(0)
+    # best effort: not tied to a user here
+    conn = get_connection()
+    log_download(conn, user_id=None, asset_count=len(selected))
     headers = {"Content-Disposition": "attachment; filename=tmf_photos.zip"}
     return StreamingResponse(buf, media_type="application/zip", headers=headers)
