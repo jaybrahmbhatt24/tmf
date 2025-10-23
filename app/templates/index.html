@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>THE MOVING FRAMES</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="container">
+    <h1>THE MOVING FRAMES</h1>
+    <p class="tagline">Find Your Moments, Just by Your Face.</p>
+
+    <section class="upload">
+      <h2>Search by Face</h2>
+      <input type="file" id="fileInput" accept="image/*" />
+      <button id="searchBtn">Search</button>
+      <div id="status"></div>
+    </section>
+
+    <section id="results" class="results hidden">
+      <h2>Results</h2>
+      <form id="downloadForm">
+        <div id="grid" class="grid"></div>
+        <button type="submit">Download Selected</button>
+      </form>
+    </section>
+  </div>
+
+  <script>
+    const fileInput = document.getElementById('fileInput');
+    const searchBtn = document.getElementById('searchBtn');
+    const statusEl = document.getElementById('status');
+    const resultsSection = document.getElementById('results');
+    const gridEl = document.getElementById('grid');
+    const downloadForm = document.getElementById('downloadForm');
+
+    searchBtn.addEventListener('click', async () => {
+      if (!fileInput.files[0]) {
+        statusEl.textContent = 'Please choose an image with your face.';
+        return;
+      }
+      statusEl.textContent = 'Searching...';
+      const formData = new FormData();
+      formData.append('file', fileInput.files[0]);
+      const res = await fetch('/search', { method: 'POST', body: formData });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        statusEl.textContent = err.detail || 'Search failed.';
+        return;
+      }
+      const data = await res.json();
+      renderResults(data.results || []);
+      statusEl.textContent = '';
+    });
+
+    function renderResults(items) {
+      gridEl.innerHTML = '';
+      if (!items.length) {
+        resultsSection.classList.add('hidden');
+        return;
+      }
+      resultsSection.classList.remove('hidden');
+      items.forEach((item) => {
+        const card = document.createElement('div');
+        card.className = 'card';
+        const label = document.createElement('label');
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.name = 'selected';
+        checkbox.value = item.image_path;
+        const img = document.createElement('img');
+        img.src = '/gallery/' + item.image_path; // Served by static mapping via reverse proxy or dev server
+        const meta = document.createElement('div');
+        meta.className = 'meta';
+        meta.textContent = 'distance: ' + item.distance;
+        label.appendChild(checkbox);
+        label.appendChild(img);
+        card.appendChild(label);
+        card.appendChild(meta);
+        gridEl.appendChild(card);
+      });
+    }
+
+    downloadForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const selected = Array.from(document.querySelectorAll('input[name="selected"]:checked')).map(
+        (el) => el.value
+      );
+      if (!selected.length) return;
+      const formData = new FormData();
+      selected.forEach((p) => formData.append('selected', p));
+      const res = await fetch('/download', { method: 'POST', body: formData });
+      if (!res.ok) return;
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'tmf_photos.zip';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    });
+  </script>
+</body>
+</html>
